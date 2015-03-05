@@ -1,6 +1,18 @@
 #!/usr/bin/env python
-import boto.dynamodb2.layer1, json, sys, time, shutil, os, argparse, logging, datetime, threading
+import json
+import sys
+import time
+import shutil
+import os
+import argparse
+import logging
+import datetime
+import threading
 from boto.dynamodb2.layer1 import DynamoDBConnection
+import boto.dynamodb2.layer1
+from boto.s3.connection import S3Connection
+from boto.s3.connection import Location
+from boto.s3.connection import Key
 
 JSON_INDENT = 2
 AWS_SLEEP_INTERVAL = 10 #seconds
@@ -157,20 +169,48 @@ def update_provisioned_throughput(conn, table_name, read_capacity, write_capacit
   if wait:
     wait_for_active_table(conn, table_name, "updated")
 
-def do_backup(conn, table_name, read_capacity):
+def create_s3_bucket(region, bucket):
+  conn = S3Connection()
+  try:
+    bucket_id = conn.create_bucket(bucket)
+    logging.info("Created bucket: %s" % (bucket))
+  except boto.exception.S3CreateError:
+    bucket_id = conn.get_bucket(bucket)
+    logging.info("Bucket: %s already exists" % (bucket))
+
+  return bucket_id
+
+def s3_file_write(bucket_id, content, path):
+  k = Key(bucket_id)
+  logging.info("Creating file: %s" % (path))
+  k.key = path
+  k.set_contents_from_string(content)
+
+def do_backup(conn, table_name, read_capacity, s3bucket, s3region):
   logging.info("Starting backup for " + table_name + "..")
 
-  # trash data, re-create subdir
-  if os.path.exists(DUMP_PATH + "/" + table_name):
-    shutil.rmtree(DUMP_PATH + "/" + table_name)
-  mkdir_p(DUMP_PATH + "/" + table_name)
+  # if s3 bucket is passed, create <bucket>/<table name>
+  if s3bucket:
+    bucket_id = create_s3_bucket(s3region, s3bucket)
+  else:
+    # trash data, re-create subdir
+    if os.path.exists(DUMP_PATH + "/" + table_name):
+      shutil.rmtree(DUMP_PATH + "/" + table_name)
+    mkdir_p(DUMP_PATH + "/" + table_name)
 
-  # get table schema
-  logging.info("Dumping table schema for " + table_name)
-  f = open(DUMP_PATH + "/" + table_name + "/" + SCHEMA_FILE, "w+")
   table_desc = conn.describe_table(table_name)
-  f.write(json.dumps(table_desc, indent=JSON_INDENT))
-  f.close()
+
+  # if s3bucket is passed, create schema file in bucket
+  if s3bucket:
+    path = DUMP_PATH + "/" + table_name + "/" + SCHEMA_FILE
+    content = json.dumps(table_desc, indent=JSON_INDENT)
+    s3_file_write(bucket_id, content, path)
+  else:
+    # get table schema
+    logging.info("Dumping table schema for " + table_name)
+    f = open(DUMP_PATH + "/" + table_name + "/" + SCHEMA_FILE, "w+")
+    f.write(json.dumps(table_desc, indent=JSON_INDENT))
+    f.close()
 
   original_read_capacity = table_desc["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
   original_write_capacity = table_desc["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
@@ -181,7 +221,6 @@ def do_backup(conn, table_name, read_capacity):
 
   # get table data
   logging.info("Dumping table items for " + table_name)
-  mkdir_p(DUMP_PATH + "/" + table_name + "/" + DATA_DIR)
 
   i = 1
   last_evaluated_key = None
@@ -189,12 +228,17 @@ def do_backup(conn, table_name, read_capacity):
   while True:
     scanned_table = conn.scan(table_name, exclusive_start_key=last_evaluated_key)
 
-    f = open(DUMP_PATH + "/" + table_name + "/" + DATA_DIR + "/" + str(i).zfill(4) + ".json", "w+")
-    f.write(json.dumps(scanned_table, indent=JSON_INDENT))
-    f.close()
+    if s3bucket:
+      path = DUMP_PATH + "/" + table_name + "/" + DATA_DIR + "/" + str(i).zfill(4) + ".json"
+      content = json.dumps(scanned_table, indent=JSON_INDENT)
+      s3_file_write(bucket_id, content, path)
+    else:
+      mkdir_p(DUMP_PATH + "/" + table_name + "/" + DATA_DIR)
+      f = open(DUMP_PATH + "/" + table_name + "/" + DATA_DIR + "/" + str(i).zfill(4) + ".json", "w+")
+      f.write(json.dumps(scanned_table, indent=JSON_INDENT))
+      f.close()
 
     i += 1
-
     try:
       last_evaluated_key = scanned_table["LastEvaluatedKey"]
     except KeyError, e:
@@ -322,99 +366,131 @@ def do_restore(conn, sleep_interval, source_table, destination_table, write_capa
 
   logging.info("Restore for " + source_table + " to " + destination_table + " table completed. Time taken: " + str(datetime.datetime.now().replace(microsecond=0) - start_time))
 
+if __name__ == '__main__':
 # parse args
-parser = argparse.ArgumentParser(description="Simple DynamoDB backup/restore.")
-parser.add_argument("-m", "--mode", help="'backup' or 'restore'")
-parser.add_argument("-r", "--region", help="AWS region to use, e.g. 'us-west-1'. Use '" + LOCAL_REGION + "' for local DynamoDB testing.")
-parser.add_argument("-s", "--srcTable", help="Source DynamoDB table name to backup or restore from, use 'tablename*' for wildcard prefix selection")
-parser.add_argument("-d", "--destTable", help="Destination DynamoDB table name to backup or restore to, use 'tablename*' for wildcard prefix selection (defaults to use '-' separator) [optional, defaults to source]")
-parser.add_argument("--prefixSeparator", help="Specify a different prefix separator, e.g. '.' [optional]")
-parser.add_argument("--noSeparator", action='store_true', help="Overrides the use of a prefix separator for backup wildcard searches, [optional]")
-parser.add_argument("--readCapacity", help="Change the temp read capacity of the DynamoDB table to backup from [optional]")
-parser.add_argument("--writeCapacity", help="Change the temp write capacity of the DynamoDB table to restore to [defaults to " + str(RESTORE_WRITE_CAPACITY) + ", optional]")
-parser.add_argument("--host", help="Host of local DynamoDB [required only for local]")
-parser.add_argument("--port", help="Port of local DynamoDB [required only for local]")
-parser.add_argument("--accessKey", help="Access key of local DynamoDB [required only for local]")
-parser.add_argument("--secretKey", help="Secret key of local DynamoDB [required only for local]")
-parser.add_argument("--log", help="Logging level - DEBUG|INFO|WARNING|ERROR|CRITICAL [optional]")
-args = parser.parse_args()
+  parser = argparse.ArgumentParser(description="Simple DynamoDB backup/restore.")
+  parser.add_argument("-m", "--mode",
+    help="'backup' or 'restore'")
+  parser.add_argument("-r", "--region",
+    help="AWS region to use, e.g. 'us-west-1'. Use '" + LOCAL_REGION + "' for local DynamoDB testing.")
+  parser.add_argument("-s", "--srcTable",
+    help="Source DynamoDB table name to backup or restore from, use 'tablename*' for wildcard prefix selection")
+  parser.add_argument("-d", "--destTable",
+    help="Destination DynamoDB table name to backup or restore to, use 'tablename*' for wildcard prefix selection (defaults to use '-' separator) [optional, defaults to source]")
+  parser.add_argument("--prefixSeparator",
+    help="Specify a different prefix separator, e.g. '.' [optional]")
+  parser.add_argument("--noSeparator",
+    action='store_true',
+    help="Overrides the use of a prefix separator for backup wildcard searches, [optional]")
+  parser.add_argument("--readCapacity",
+    help="Change the temp read capacity of the DynamoDB table to backup from [optional]")
+  parser.add_argument("--writeCapacity",
+    help="Change the temp write capacity of the DynamoDB table to restore to [defaults to " + str(RESTORE_WRITE_CAPACITY) + ", optional]")
+  parser.add_argument("--host",
+    help="Host of local DynamoDB [required only for local]")
+  parser.add_argument("--port",
+    help="Port of local DynamoDB [required only for local]")
+  parser.add_argument("--accessKey",
+    help="Access key of local DynamoDB [required only for local]")
+  parser.add_argument("--secretKey",
+    help="Secret key of local DynamoDB [required only for local]")
+  parser.add_argument("--log",
+    help="Logging level - DEBUG|INFO|WARNING|ERROR|CRITICAL [optional]")
+  parser.add_argument("--s3bucket",
+    help="Name of the s3 bucket to use for backup or restore")
+  parser.add_argument("--s3region",
+    help="Region where the s3 bucket resides")
+  args = parser.parse_args()
 
-# set log level
-log_level = LOG_LEVEL
-if args.log != None:
-  log_level = args.log.upper()
-logging.basicConfig(level=getattr(logging, log_level))
+  # set log level
+  log_level = LOG_LEVEL
+  if args.log != None:
+    log_level = args.log.upper()
+  logging.basicConfig(level=getattr(logging, log_level))
 
-# instantiate connection
-if args.region == LOCAL_REGION:
-  conn = DynamoDBConnection(aws_access_key_id=args.accessKey, aws_secret_access_key=args.secretKey, host=args.host, port=int(args.port), is_secure=False)
-  sleep_interval = LOCAL_SLEEP_INTERVAL
-else:
-  conn = boto.dynamodb2.connect_to_region(args.region, aws_access_key_id=args.accessKey, aws_secret_access_key=args.secretKey)
-  sleep_interval = AWS_SLEEP_INTERVAL
-
-# set prefix separator
-prefix_separator = DEFAULT_PREFIX_SEPARATOR
-if args.prefixSeparator != None:
-  prefix_separator = args.prefixSeparator
-if args.noSeparator == True:
-  prefix_separator = None  
-
-# do backup/restore
-start_time = datetime.datetime.now().replace(microsecond=0)
-if args.mode == "backup":
-  if args.srcTable.find("*") != -1:
-    matching_backup_tables = get_table_name_matches(conn, args.srcTable, prefix_separator)
-    logging.info("Found " + str(len(matching_backup_tables)) + " table(s) in DynamoDB host to backup: " + ", ".join(matching_backup_tables))
-
-    threads = []
-    for table_name in matching_backup_tables:
-      t = threading.Thread(target=do_backup, args=(conn, table_name, args.readCapacity,))
-      threads.append(t)
-      t.start()
-      time.sleep(THREAD_START_DELAY)
-
-    for thread in threads:
-      thread.join()
-
-    logging.info("Backup of table(s) " + args.srcTable + " completed!")
+  # instantiate connection
+  if args.region == LOCAL_REGION:
+    conn = DynamoDBConnection(
+      aws_access_key_id=args.accessKey,
+      aws_secret_access_key=args.secretKey,
+      host=args.host,
+      port=int(args.port),
+      is_secure=False
+    )
+    sleep_interval = LOCAL_SLEEP_INTERVAL
   else:
-    do_backup(conn, args.srcTable, args.readCapacity)
-elif args.mode == "restore":
-  if args.destTable != None:
-    dest_table = args.destTable
-  else:
-    dest_table = args.srcTable
+    conn = boto.dynamodb2.connect_to_region(
+      args.region,
+      aws_access_key_id=args.accessKey,
+      aws_secret_access_key=args.secretKey
+    )
+    sleep_interval = AWS_SLEEP_INTERVAL
 
-  if dest_table.find("*") != -1:
-    matching_destination_tables = get_table_name_matches(conn, dest_table, prefix_separator)
-    logging.info("Found " + str(len(matching_destination_tables)) + " table(s) in DynamoDB host to be deleted: " + ", ".join(matching_destination_tables))
+  # set prefix separator
+  prefix_separator = DEFAULT_PREFIX_SEPARATOR
+  if args.prefixSeparator != None:
+    prefix_separator = args.prefixSeparator
+  if args.noSeparator == True:
+    prefix_separator = None
 
-    threads = []
-    for table_name in matching_destination_tables:
-      t = threading.Thread(target=delete_table, args=(conn, sleep_interval, table_name,))
-      threads.append(t)
-      t.start()
-      time.sleep(THREAD_START_DELAY)
+  # do backup/restore
+  start_time = datetime.datetime.now().replace(microsecond=0)
+  if args.mode == "backup":
+    if args.srcTable.find("*") != -1:
+      matching_backup_tables = get_table_name_matches(conn, args.srcTable, prefix_separator)
+      logging.info("Found " + str(len(matching_backup_tables)) + " table(s) in DynamoDB host to backup: " + ", ".join(matching_backup_tables))
 
-    for thread in threads:
-      thread.join()
+      threads = []
+      for table_name in matching_backup_tables:
+        t = threading.Thread(target=do_backup,
+          args=(conn, table_name,
+                args.readCapacity, args.s3bucket, args.s3region))
+        threads.append(t)
+        t.start()
+        time.sleep(THREAD_START_DELAY)
 
-    matching_restore_tables = get_restore_table_matches(args.srcTable, prefix_separator)
-    logging.info("Found " + str(len(matching_restore_tables)) + " table(s) in " + DUMP_PATH + " to restore: " + ", ".join(matching_restore_tables))
+      for thread in threads:
+        thread.join()
 
-    threads = []
-    for source_table in matching_restore_tables:
-      t = threading.Thread(target=do_restore, args=(conn, sleep_interval, source_table, change_prefix(source_table, args.srcTable, dest_table, prefix_separator), args.writeCapacity,))
-      threads.append(t)
-      t.start()
-      time.sleep(THREAD_START_DELAY)
+      logging.info("Backup of table(s) " + args.srcTable + " completed!")
+    else:
+      do_backup(conn, args.srcTable, args.readCapacity,
+        args.s3bucket, args.s3region)
+  elif args.mode == "restore":
+    if args.destTable != None:
+      dest_table = args.destTable
+    else:
+      dest_table = args.srcTable
 
-    for thread in threads:
-      thread.join()
+    if dest_table.find("*") != -1:
+      matching_destination_tables = get_table_name_matches(conn, dest_table, prefix_separator)
+      logging.info("Found " + str(len(matching_destination_tables)) + " table(s) in DynamoDB host to be deleted: " + ", ".join(matching_destination_tables))
 
-    logging.info("Restore of table(s) " + args.srcTable + " to " +  dest_table + " completed!")
-  else:
-    delete_table(conn, sleep_interval, dest_table)
-    do_restore(conn, sleep_interval, args.srcTable, dest_table, args.writeCapacity)
+      threads = []
+      for table_name in matching_destination_tables:
+        t = threading.Thread(target=delete_table, args=(conn, sleep_interval, table_name,))
+        threads.append(t)
+        t.start()
+        time.sleep(THREAD_START_DELAY)
+
+      for thread in threads:
+        thread.join()
+
+      matching_restore_tables = get_restore_table_matches(args.srcTable, prefix_separator)
+      logging.info("Found " + str(len(matching_restore_tables)) + " table(s) in " + DUMP_PATH + " to restore: " + ", ".join(matching_restore_tables))
+
+      threads = []
+      for source_table in matching_restore_tables:
+        t = threading.Thread(target=do_restore, args=(conn, sleep_interval, source_table, change_prefix(source_table, args.srcTable, dest_table, prefix_separator), args.writeCapacity,))
+        threads.append(t)
+        t.start()
+        time.sleep(THREAD_START_DELAY)
+
+      for thread in threads:
+        thread.join()
+
+      logging.info("Restore of table(s) " + args.srcTable + " to " +  dest_table + " completed!")
+    else:
+      delete_table(conn, sleep_interval, dest_table)
+      do_restore(conn, sleep_interval, args.srcTable, dest_table, args.writeCapacity)
 
