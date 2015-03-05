@@ -169,8 +169,12 @@ def update_provisioned_throughput(conn, table_name, read_capacity, write_capacit
   if wait:
     wait_for_active_table(conn, table_name, "updated")
 
-def create_s3_bucket(region, bucket):
+def connect_to_s3():
   conn = S3Connection()
+
+  return conn
+
+def create_s3_bucket(conn, region, bucket):
   try:
     bucket_id = conn.create_bucket(bucket)
     logging.info("Created bucket: %s" % (bucket))
@@ -180,13 +184,19 @@ def create_s3_bucket(region, bucket):
 
   return bucket_id
 
-def s3_file_write(bucket_id, content, path):
+def s3_file_write(conn, bucket_id, content, path):
   k = Key(bucket_id)
   logging.info("Creating file: %s" % (path))
   k.key = path
   k.set_contents_from_string(content)
 
-def do_backup(conn, table_name, read_capacity, s3bucket, s3region, dump_path):
+def s3_file_read(conn, bucket_id, path):
+  content = bucket_id.get_contents_as_string(path)
+
+  return content
+
+def do_backup(conn, table_name, read_capacity,
+              s3conn, s3bucket, s3location, dump_path):
   # if dump path is passed in, override the default dump path
   if dump_path:
     DUMP_PATH = dump_path
@@ -195,7 +205,7 @@ def do_backup(conn, table_name, read_capacity, s3bucket, s3region, dump_path):
 
   # if s3 bucket is passed, create <bucket>/<table name>
   if s3bucket:
-    bucket_id = create_s3_bucket(s3region, s3bucket)
+    bucket_id = create_s3_bucket(s3conn, s3location, s3bucket)
   else:
     # trash data, re-create subdir
     if os.path.exists(DUMP_PATH + "/" + table_name):
@@ -208,7 +218,7 @@ def do_backup(conn, table_name, read_capacity, s3bucket, s3region, dump_path):
   if s3bucket:
     path = DUMP_PATH + "/" + table_name + "/" + SCHEMA_FILE
     content = json.dumps(table_desc, indent=JSON_INDENT)
-    s3_file_write(bucket_id, content, path)
+    s3_file_write(s3conn, bucket_id, content, path)
   else:
     # get table schema
     logging.info("Dumping table schema for " + table_name)
@@ -235,7 +245,7 @@ def do_backup(conn, table_name, read_capacity, s3bucket, s3region, dump_path):
     if s3bucket:
       path = DUMP_PATH + "/" + table_name + "/" + DATA_DIR + "/" + str(i).zfill(4) + ".json"
       content = json.dumps(scanned_table, indent=JSON_INDENT)
-      s3_file_write(bucket_id, content, path)
+      s3_file_write(s3conn, bucket_id, content, path)
     else:
       mkdir_p(DUMP_PATH + "/" + table_name + "/" + DATA_DIR)
       f = open(DUMP_PATH + "/" + table_name + "/" + DATA_DIR + "/" + str(i).zfill(4) + ".json", "w+")
@@ -254,8 +264,16 @@ def do_backup(conn, table_name, read_capacity, s3bucket, s3region, dump_path):
 
   logging.info("Backup for " + table_name + " table completed. Time taken: " + str(datetime.datetime.now().replace(microsecond=0) - start_time))
 
-def do_restore(conn, sleep_interval, source_table, destination_table, write_capacity):
+def do_restore(conn, sleep_interval, source_table,
+               destination_table, write_capacity,
+               s3conn, s3bucket, dump_path):
+  if dump_path:
+    DUMP_PATH = dump_path
+
   logging.info("Starting restore for " + source_table + " to " + destination_table + "..")
+
+  if s3bucket:
+    pass
 
   # create table using schema
   # restore source_table from dump directory if it exists else try current working directory
@@ -402,12 +420,16 @@ if __name__ == '__main__':
     help="Logging level - DEBUG|INFO|WARNING|ERROR|CRITICAL [optional]")
   parser.add_argument("--s3bucket",
     help="Name of the s3 bucket to use for backup or restore")
-  parser.add_argument("--s3region",
-    help="Region where the s3 bucket resides")
+  parser.add_argument("--s3location",
+    help="Location where the s3 bucket resides")
   parser.add_argument("--dumpPath",
     help="Path where backup will be stored or restore will be taken from")
   args = parser.parse_args()
 
+  # if s3bucket is specified, connect once and pass the connection around
+  # during execution
+  if args.s3bucket:
+    s3_conn = connect_to_s3()
   # set log level
   log_level = LOG_LEVEL
   if args.log != None:
@@ -451,7 +473,7 @@ if __name__ == '__main__':
         t = threading.Thread(target=do_backup,
           args=(conn, table_name,
                 args.readCapacity, args.s3bucket,
-                args.s3region, args.dumpPath))
+                args.s3location, args.dumpPath))
         threads.append(t)
         t.start()
         time.sleep(THREAD_START_DELAY)
@@ -462,7 +484,7 @@ if __name__ == '__main__':
       logging.info("Backup of table(s) " + args.srcTable + " completed!")
     else:
       do_backup(conn, args.srcTable, args.readCapacity,
-        args.s3bucket, args.s3region, args.dumpPath)
+        s3_conn, args.s3bucket, args.s3location, args.dumpPath)
   elif args.mode == "restore":
     if args.destTable != None:
       dest_table = args.destTable
