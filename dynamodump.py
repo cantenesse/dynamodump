@@ -273,7 +273,16 @@ def do_restore(conn, sleep_interval, source_table,
   logging.info("Starting restore for " + source_table + " to " + destination_table + "..")
 
   if s3bucket:
-    pass
+    try:
+      bucket = s3conn.get_bucket(s3bucket)
+    except boto.exception.S3ResponseError:
+      logging.info("Bucket: %s does not exist" % s3bucket)
+
+    print dump_path
+    for f in bucket.list(prefix=dump_path):
+      print f.name
+
+    sys.exit()
 
   # create table using schema
   # restore source_table from dump directory if it exists else try current working directory
@@ -430,6 +439,7 @@ if __name__ == '__main__':
   # during execution
   if args.s3bucket:
     s3_conn = connect_to_s3()
+
   # set log level
   log_level = LOG_LEVEL
   if args.log != None:
@@ -510,7 +520,18 @@ if __name__ == '__main__':
 
       threads = []
       for source_table in matching_restore_tables:
-        t = threading.Thread(target=do_restore, args=(conn, sleep_interval, source_table, change_prefix(source_table, args.srcTable, dest_table, prefix_separator), args.writeCapacity,))
+        t = threading.Thread(target=do_restore,
+                             args=(conn, sleep_interval,
+                                   source_table, change_prefix(
+                                    source_table,
+                                    args.srcTable,
+                                    dest_table,
+                                    prefix_separator
+                                  ),
+                                   args.writeCapacity,
+                                   s3_conn,
+                                   args.s3bucket,
+                                   args.dumpPath))
         threads.append(t)
         t.start()
         time.sleep(THREAD_START_DELAY)
@@ -521,5 +542,7 @@ if __name__ == '__main__':
       logging.info("Restore of table(s) " + args.srcTable + " to " +  dest_table + " completed!")
     else:
       delete_table(conn, sleep_interval, dest_table)
-      do_restore(conn, sleep_interval, args.srcTable, dest_table, args.writeCapacity)
+      do_restore(conn, sleep_interval, args.srcTable,
+                 dest_table, args.writeCapacity, s3_conn,
+                 args.s3bucket, args.dumpPath)
 
